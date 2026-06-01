@@ -31,7 +31,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Fast-forward fork branches and tags
+      - name: Sync fork branches and tags
         env:
           BRANCHES: main nightly
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -59,12 +59,12 @@ jobs:
             if git show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
               git checkout -B "${branch}" "origin/${branch}"
 
-              if ! git merge-base --is-ancestor "HEAD" "upstream/${branch}"; then
-                echo "::error::origin/${branch} cannot be fast-forwarded to upstream/${branch}. Resolve the divergence manually."
-                exit 1
+              if git merge-base --is-ancestor "HEAD" "upstream/${branch}"; then
+                git merge --ff-only "upstream/${branch}"
+              else
+                echo "origin/${branch} has fork-only commits; merging upstream/${branch} instead of fast-forwarding."
+                git merge --no-edit -m "Merge upstream/${branch} into ${branch}" "upstream/${branch}"
               fi
-
-              git merge --ff-only "upstream/${branch}"
             else
               echo "Fork branch ${branch} is missing; creating it from upstream/${branch}."
               git checkout -B "${branch}" "upstream/${branch}"
