@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.SYNC_FORK_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Configure git
         run: |
@@ -34,7 +34,7 @@ jobs:
       - name: Sync fork branches and tags
         env:
           BRANCHES: main nightly
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_FORK_TOKEN || secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -47,8 +47,8 @@ jobs:
           fi
 
           git remote add upstream "${upstream_url}"
-          git fetch --prune origin
-          git fetch --prune --tags upstream
+          git fetch --prune --no-tags origin
+          git fetch --prune --no-tags upstream
 
           for branch in ${BRANCHES}; do
             if ! git show-ref --verify --quiet "refs/remotes/upstream/${branch}"; then
@@ -73,4 +73,31 @@ jobs:
             git push origin "HEAD:${branch}"
           done
 
-          git push origin --tags
+          echo "Syncing upstream release tags that match vX.Y.Z."
+          mapfile -t release_tags < <(
+            git ls-remote --refs --tags upstream "v*" |
+              awk '$2 ~ /^refs\/tags\/v[0-9]+\.[0-9]+\.[0-9]+$/ { sub("^refs/tags/", "", $2); print $2 }' |
+              sort -V
+          )
+
+          for tag in "${release_tags[@]}"; do
+            if git ls-remote --exit-code --refs --tags origin "${tag}" >/dev/null 2>&1; then
+              echo "Tag ${tag} already exists in origin; skipping."
+              continue
+            fi
+
+            git fetch --force --no-tags upstream "refs/tags/${tag}:refs/tags/${tag}"
+
+            if push_output="$(git push origin "refs/tags/${tag}:refs/tags/${tag}" 2>&1)"; then
+              echo "${push_output}"
+              continue
+            fi
+
+            echo "${push_output}"
+            if grep -q "refusing to allow a GitHub App to create or update workflow" <<<"${push_output}"; then
+              echo "::warning::Skipping ${tag}; configure SYNC_FORK_TOKEN with workflow permission if this release tag must be mirrored."
+              continue
+            fi
+
+            exit 1
+          done

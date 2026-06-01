@@ -57,11 +57,17 @@ jobs:
           set -euo pipefail
 
           image_name="ghcr.io/${GITHUB_REPOSITORY,,}"
+          standard_tag_regex='^v[0-9]+\.[0-9]+\.[0-9]+$'
           git fetch --force --tags origin
-          latest_tag="$(git tag --list --sort=-v:refname | head -n 1)"
+          latest_tag="$(git tag --list "v*" --sort=-v:refname | awk "/${standard_tag_regex}/ { print; exit }")"
           echo "latest_tag=${latest_tag}" >> "${GITHUB_OUTPUT}"
 
           if [[ -n "${REQUESTED_TAG}" ]]; then
+            if [[ ! "${REQUESTED_TAG}" =~ ${standard_tag_regex} ]]; then
+              echo "::error::Tag ${REQUESTED_TAG} is not a supported release tag. Use the vX.Y.Z format."
+              exit 1
+            fi
+
             if ! git rev-parse --verify --quiet "refs/tags/${REQUESTED_TAG}" >/dev/null; then
               echo "::error::Tag ${REQUESTED_TAG} does not exist in this fork. Run sync_fork first or push the tag."
               exit 1
@@ -69,7 +75,7 @@ jobs:
 
             candidates=("${REQUESTED_TAG}")
           else
-            mapfile -t candidates < <(git tag --list --sort=-v:refname)
+            mapfile -t candidates < <(git tag --list "v*" --sort=-v:refname | awk "/${standard_tag_regex}/")
           fi
 
           missing=()
