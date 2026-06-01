@@ -1,0 +1,76 @@
+name: sync_fork
+
+on:
+  schedule:
+    # Keep the fork close to upstream; Docker publishing runs after this workflow succeeds.
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-fork
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: ${{ github.event.repository.fork }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fast-forward fork branches and tags
+        env:
+          BRANCHES: main nightly
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          upstream_url="$(gh api "repos/${GITHUB_REPOSITORY}" --jq ".parent.clone_url // empty")"
+
+          if [[ -z "${upstream_url}" ]]; then
+            echo "::error::This workflow must run from a fork so GitHub can expose the upstream repository URL."
+            exit 1
+          fi
+
+          git remote add upstream "${upstream_url}"
+          git fetch --prune origin
+          git fetch --prune --tags upstream
+
+          for branch in ${BRANCHES}; do
+            if ! git show-ref --verify --quiet "refs/remotes/upstream/${branch}"; then
+              echo "Upstream branch ${branch} does not exist; skipping."
+              continue
+            fi
+
+            if git show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
+              git checkout -B "${branch}" "origin/${branch}"
+
+              if ! git merge-base --is-ancestor "HEAD" "upstream/${branch}"; then
+                echo "::error::origin/${branch} cannot be fast-forwarded to upstream/${branch}. Resolve the divergence manually."
+                exit 1
+              fi
+
+              git merge --ff-only "upstream/${branch}"
+            else
+              echo "Fork branch ${branch} is missing; creating it from upstream/${branch}."
+              git checkout -B "${branch}" "upstream/${branch}"
+            fi
+
+            git push origin "HEAD:${branch}"
+          done
+
+          git push origin --tags

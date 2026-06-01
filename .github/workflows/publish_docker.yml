@@ -1,0 +1,189 @@
+name: publish_docker
+
+on:
+  workflow_run:
+    workflows: ["sync_fork"]
+    types: [completed]
+  schedule:
+    # Safety net in case a tag already exists in the fork but no image was published yet.
+    - cron: "47 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional tag to publish, for example v0.2.1. Leave empty to publish every missing tag."
+        required: false
+        type: string
+
+concurrency:
+  group: publish-docker
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  discover-tags:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      has_tags: ${{ steps.discover.outputs.has_tags }}
+      tags: ${{ steps.discover.outputs.tags }}
+      latest_tag: ${{ steps.discover.outputs.latest_tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Discover tags missing from GHCR
+        id: discover
+        env:
+          REQUESTED_TAG: ${{ github.event.inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          image_name="ghcr.io/${GITHUB_REPOSITORY,,}"
+          git fetch --force --tags origin
+          latest_tag="$(git tag --list --sort=-v:refname | head -n 1)"
+          echo "latest_tag=${latest_tag}" >> "${GITHUB_OUTPUT}"
+
+          if [[ -n "${REQUESTED_TAG}" ]]; then
+            if ! git rev-parse --verify --quiet "refs/tags/${REQUESTED_TAG}" >/dev/null; then
+              echo "::error::Tag ${REQUESTED_TAG} does not exist in this fork. Run sync_fork first or push the tag."
+              exit 1
+            fi
+
+            candidates=("${REQUESTED_TAG}")
+          else
+            mapfile -t candidates < <(git tag --list --sort=-v:refname)
+          fi
+
+          missing=()
+          already_missing() {
+            local needle="$1"
+            local tag
+
+            for tag in "${missing[@]}"; do
+              [[ "${tag}" == "${needle}" ]] && return 0
+            done
+
+            return 1
+          }
+
+          image_digest() {
+            docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>/dev/null | jq -r '.digest // empty'
+          }
+
+          for tag in "${candidates[@]}"; do
+            if [[ ! "${tag}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+              echo "::warning::Skipping tag ${tag}; it is not a valid Docker tag."
+              continue
+            fi
+
+            if docker buildx imagetools inspect "${image_name}:${tag}" >/dev/null 2>&1; then
+              echo "Image ${image_name}:${tag} already exists."
+            else
+              echo "Image ${image_name}:${tag} is missing and will be published."
+              missing+=("${tag}")
+            fi
+          done
+
+          if [[ -n "${latest_tag}" ]] && [[ "${latest_tag}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            should_check_latest=false
+            for tag in "${candidates[@]}"; do
+              if [[ "${tag}" == "${latest_tag}" ]]; then
+                should_check_latest=true
+                break
+              fi
+            done
+
+            if [[ "${should_check_latest}" == "true" ]] && ! already_missing "${latest_tag}"; then
+              version_digest="$(image_digest "${image_name}:${latest_tag}")"
+              latest_digest="$(image_digest "${image_name}:latest")"
+
+              if [[ -z "${latest_digest}" || "${latest_digest}" != "${version_digest}" ]]; then
+                echo "Image ${image_name}:latest is missing or outdated and will be updated from ${latest_tag}."
+                missing+=("${latest_tag}")
+              fi
+            fi
+          fi
+
+          if [[ ${#missing[@]} -eq 0 ]]; then
+            echo "No unpublished tags found."
+            echo "has_tags=false" >> "${GITHUB_OUTPUT}"
+            echo "tags=[]" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          json="$(printf '%s\n' "${missing[@]}" | jq -R . | jq -sc .)"
+          echo "has_tags=true" >> "${GITHUB_OUTPUT}"
+          echo "tags=${json}" >> "${GITHUB_OUTPUT}"
+
+  publish:
+    needs: discover-tags
+    if: ${{ needs.discover-tags.outputs.has_tags == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJSON(needs.discover-tags.outputs.tags) }}
+
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ matrix.tag }}
+          fetch-depth: 0
+
+      - name: Set image name
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=${{ matrix.tag }}
+            type=raw,value=latest,enable=${{ matrix.tag == needs.discover-tags.outputs.latest_tag }}
+          labels: |
+            org.opencontainers.image.version=${{ matrix.tag }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
